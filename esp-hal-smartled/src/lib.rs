@@ -24,7 +24,7 @@
 #![deny(missing_docs)]
 #![no_std]
 
-use core::{fmt::Debug, slice::IterMut};
+use core::{fmt::Debug, marker::PhantomData, slice::IterMut, usize};
 
 use esp_hal::{
     clock::Clocks,
@@ -32,7 +32,9 @@ use esp_hal::{
     peripheral::Peripheral,
     rmt::{Error as RmtError, PulseCode, TxChannel, TxChannelConfig, TxChannelCreator},
 };
-use smart_leds_trait::{SmartLedsWrite, RGB8};
+use smart_leds_trait::{SmartLedsWrite, RGB8, RGBW};
+
+type RGBW8 = RGBW<u8, u8>;
 
 const SK68XX_CODE_PERIOD: u32 = 1200;
 const SK68XX_T0H_NS: u32 = 320;
@@ -58,14 +60,14 @@ pub enum LedAdapterError {
 /// an `LedAdapterError:BufferSizeExceeded` error.
 #[macro_export]
 macro_rules! smartLedBuffer {
-    ( $buffer_size: literal ) => {
+    ( $buffer_size: literal,$number_of_components: literal ) => {
         // The size we're assigning here is calculated as following
         //  (
         //   Nr. of LEDs
         //   * channels (r,g,b -> 3)
         //   * pulses per channel 8)
         //  ) + 1 additional pulse for the end delimiter
-        [0u32; $buffer_size * 24 + 1]
+        [0u32; $buffer_size * $number_of_components * 8 + 1]
     };
 }
 
@@ -88,7 +90,6 @@ where
     pub fn new<C, O>(
         channel: C,
         pin: impl Peripheral<P = O> + 'd,
-        rmt_buffer: [u32; BUFFER_SIZE],
         clocks: &Clocks,
     ) -> SmartLedsAdapter<TX, BUFFER_SIZE>
     where
@@ -111,7 +112,7 @@ where
 
         Self {
             channel: Some(channel),
-            rmt_buffer,
+            rmt_buffer: [0u32; BUFFER_SIZE],
             pulses: (
                 u32::from(PulseCode {
                     level1: true,
@@ -128,73 +129,150 @@ where
             ),
         }
     }
+}
 
-    fn convert_rgb_to_pulse(
-        value: RGB8,
-        mut_iter: &mut IterMut<u32>,
-        pulses: (u32, u32),
-    ) -> Result<(), LedAdapterError> {
-        Self::convert_rgb_channel_to_pulses(value.g, mut_iter, pulses)?;
-        Self::convert_rgb_channel_to_pulses(value.r, mut_iter, pulses)?;
-        Self::convert_rgb_channel_to_pulses(value.b, mut_iter, pulses)?;
-
-        Ok(())
+fn convert_rgb_channel_to_pulses(
+    channel_value: u8,
+    mut_iter: &mut IterMut<u32>,
+    pulses: (u32, u32),
+) -> Result<(), LedAdapterError> {
+    for position in [128, 64, 32, 16, 8, 4, 2, 1] {
+        *mut_iter.next().ok_or(LedAdapterError::BufferSizeExceeded)? =
+            match channel_value & position {
+                0 => pulses.0,
+                _ => pulses.1,
+            }
     }
 
-    fn convert_rgb_channel_to_pulses(
-        channel_value: u8,
+    Ok(())
+}
+
+/// Encoding Color
+pub trait ConverToPulses {
+    /// Convert RBG or RGBW pixel into WS2812 pulses
+    fn convert_to_pulses(
+        self,
+        mut_iter: &mut IterMut<u32>,
+        pulses: (u32, u32),
+    ) -> Result<(), LedAdapterError>;
+}
+
+impl ConverToPulses for RGB8 {
+    fn convert_to_pulses(
+        self,
         mut_iter: &mut IterMut<u32>,
         pulses: (u32, u32),
     ) -> Result<(), LedAdapterError> {
-        for position in [128, 64, 32, 16, 8, 4, 2, 1] {
-            *mut_iter.next().ok_or(LedAdapterError::BufferSizeExceeded)? =
-                match channel_value & position {
-                    0 => pulses.0,
-                    _ => pulses.1,
-                }
-        }
-
+        convert_rgb_channel_to_pulses(self.r, mut_iter, pulses)?;
+        convert_rgb_channel_to_pulses(self.g, mut_iter, pulses)?;
+        convert_rgb_channel_to_pulses(self.b, mut_iter, pulses)?;
         Ok(())
     }
 }
 
-impl<TX, const BUFFER_SIZE: usize> SmartLedsWrite for SmartLedsAdapter<TX, BUFFER_SIZE>
+impl ConverToPulses for RGBW8 {
+    fn convert_to_pulses(
+        self,
+        mut_iter: &mut IterMut<u32>,
+        pulses: (u32, u32),
+    ) -> Result<(), LedAdapterError> {
+        convert_rgb_channel_to_pulses(self.r, mut_iter, pulses)?;
+        convert_rgb_channel_to_pulses(self.g, mut_iter, pulses)?;
+        convert_rgb_channel_to_pulses(self.b, mut_iter, pulses)?;
+        convert_rgb_channel_to_pulses(self.a.0, mut_iter, pulses)?;
+        Ok(())
+    }
+}
+
+/// LedPixelColor
+pub struct LedPixelColor<TX, const BUFFER_SIZE: usize, ColorType>
+where
+    TX: TxChannel,
+    ColorType: ConverToPulses,
+{
+    ///
+    pub adapter: SmartLedsAdapter<TX, BUFFER_SIZE>,
+
+    ///
+    pub phamtom: PhantomData<ColorType>,
+}
+
+/// LedPixelColor for RBG
+pub type LedPixelColorRGB8<TX, const BUFFER_SIZE: usize> = LedPixelColor<TX, BUFFER_SIZE, RGB8>;
+
+impl<'d, TX, const BUFFER_SIZE: usize> LedPixelColorRGB8<TX, BUFFER_SIZE>
 where
     TX: TxChannel,
 {
-    type Error = LedAdapterError;
-    type Color = RGB8;
+    /// Create a new LedPixelColor for RBG driver with 8 bit components
+    pub fn new<C, O>(channel: C, pin: impl Peripheral<P = O> + 'd, clocks: &Clocks) -> Self
+    where
+        O: OutputPin + 'd,
+        C: TxChannelCreator<'d, TX, O>,
+    {
+        Self {
+            adapter: SmartLedsAdapter::new(channel, pin, clocks),
+            phamtom: PhantomData::default(),
+        }
+    }
+}
 
-    /// Convert all RGB8 items of the iterator to the RMT format and
-    /// add them to internal buffer, then start a singular RMT operation
-    /// based on that buffer.
+/// LedPixelColor for RBGW
+pub type LedPixelColorRGBW8<TX, const BUFFER_SIZE: usize> = LedPixelColor<TX, BUFFER_SIZE, RGBW8>;
+
+impl<'d, TX, const BUFFER_SIZE: usize> LedPixelColorRGBW8<TX, BUFFER_SIZE>
+where
+    TX: TxChannel,
+{
+    /// Create a new LedPixelColor for RBGW driver 8 bit components
+    pub fn new<C, O>(channel: C, pin: impl Peripheral<P = O> + 'd, clocks: &Clocks) -> Self
+    where
+        O: OutputPin + 'd,
+        C: TxChannelCreator<'d, TX, O>,
+    {
+        Self {
+            adapter: SmartLedsAdapter::new(channel, pin, clocks),
+            phamtom: PhantomData::default(),
+        }
+    }
+}
+
+impl<TX, const BUFFER_SIZE: usize, ColorType> SmartLedsWrite
+    for LedPixelColor<TX, BUFFER_SIZE, ColorType>
+where
+    TX: TxChannel,
+    ColorType: ConverToPulses,
+{
+    type Error = LedAdapterError;
+    type Color = ColorType;
+
     fn write<T, I>(&mut self, iterator: T) -> Result<(), Self::Error>
     where
         T: IntoIterator<Item = I>,
         I: Into<Self::Color>,
     {
         // We always start from the beginning of the buffer
-        let mut seq_iter = self.rmt_buffer.iter_mut();
+        let mut seq_iter = self.adapter.rmt_buffer.iter_mut();
 
         // Add all converted iterator items to the buffer.
         // This will result in an `BufferSizeExceeded` error in case
         // the iterator provides more elements than the buffer can take.
         for item in iterator {
-            Self::convert_rgb_to_pulse(item.into(), &mut seq_iter, self.pulses)?;
+            Into::<ColorType>::into(item).convert_to_pulses(&mut seq_iter, self.adapter.pulses)?;
         }
 
         // Finally, add an end element.
         *seq_iter.next().ok_or(LedAdapterError::BufferSizeExceeded)? = 0;
 
         // Perform the actual RMT operation. We use the u32 values here right away.
-        let channel = self.channel.take().unwrap();
-        match channel.transmit(&self.rmt_buffer).wait() {
+        let channel = self.adapter.channel.take().unwrap();
+        match channel.transmit(&self.adapter.rmt_buffer).wait() {
             Ok(chan) => {
-                self.channel = Some(chan);
+                self.adapter.channel = Some(chan);
                 Ok(())
             }
             Err((e, chan)) => {
-                self.channel = Some(chan);
+                self.adapter.channel = Some(chan);
                 Err(LedAdapterError::TransmissionError(e))
             }
         }
