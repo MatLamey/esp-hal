@@ -216,21 +216,14 @@ use procmacros::ram;
 #[cfg(soc_has_clock_node_rmt_sclk)]
 use crate::soc::clocks;
 use crate::{
-    Async,
-    Blocking,
-    asynch::AtomicWaker,
-    clock::Clocks,
-    gpio::{
+    Async, Blocking, asynch::AtomicWaker, clock::Clocks, gpio::{
         self,
         InputConfig,
         Level,
         OutputConfig,
         PinGuard,
         interconnect::{PeripheralInput, PeripheralOutput},
-    },
-    peripherals::{Interrupt, RMT},
-    system::GenericPeripheralGuard,
-    time::Rate,
+    }, peripherals::{Interrupt, RMT}, rmt::writer::RmtWriterIter, system::GenericPeripheralGuard, time::Rate,
 };
 
 mod reader;
@@ -1989,6 +1982,50 @@ impl core::future::Future for TxFuture<'_> {
     }
 }
 
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+struct TxFutureIter<'a> {
+    raw: DynChannelAccess<Tx>,
+    _phantom: PhantomData<Channel<'a, Async, Tx>>,
+    writer: RmtWriterIter<'a>,
+
+    _guard: TxGuard,
+}
+
+impl core::future::Future for TxFutureIter<'_> {
+    type Output = Result<(), Error>;
+
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let raw = this.raw;
+
+        if let WriterState::Error(err) = this.writer.state() {
+            return Poll::Ready(Err(err));
+        }
+        WAKER[raw.channel() as usize].register(ctx.waker());
+
+        let result = match raw.get_tx_status() {
+            Some(Event::Error) => Err(Error::TransmissionError),
+            Some(Event::End) => this.writer.state().to_result(),
+            Some(Event::Threshold) => {
+                raw.clear_tx_interrupts(Event::Threshold);
+
+                this.writer.write();
+
+                if this.writer.state() == WriterState::Active {
+                    raw.listen_tx_interrupt(Event::Threshold);
+                }
+
+                return Poll::Pending;
+            }
+            _ => return Poll::Pending,
+        };
+
+        this._guard.set_completed();
+
+        Poll::Ready(result)
+    }
+}
+
 /// TX channel in async mode
 impl Channel<'_, Async, Tx> {
     /// Start transmitting the given pulse code sequence.
@@ -2025,6 +2062,48 @@ impl Channel<'_, Async, Tx> {
             _phantom: PhantomData,
             writer,
             data,
+            _guard,
+        }
+    }
+
+    /// Start transmitting using an iterator over pulse codes.
+    #[cfg_attr(place_rmt_driver_in_ram, ram)]
+    pub fn transmit_iter<'a, I: ExactSizeIterator<Item = PulseCode> + 'a>(
+        &mut self,
+        data: &'a mut I,
+    ) -> impl Future<Output = Result<(), Error>> + 'a {
+        let raw = self.raw;
+        let memsize = raw.memsize();
+
+        let mut writer = RmtWriterIter::new(raw, data);
+
+
+        writer.write();
+
+        let _guard = if writer.state().is_ok() {
+            let wrap = match writer.state() {
+                WriterState::Error(_) => false,
+                WriterState::Active => true,
+                WriterState::Done => false,
+            };
+
+            raw.clear_tx_interrupts(EnumSet::all());
+            let mut events = Event::End | Event::Error;
+            if wrap {
+                events |= Event::Threshold;
+            }
+            raw.listen_tx_interrupt(events);
+            raw.start_send(None, memsize);
+
+            TxGuard::new(raw)
+        } else {
+            TxGuard::new_empty()
+        };
+
+        TxFutureIter {
+            raw,
+            _phantom: PhantomData,
+            writer,
             _guard,
         }
     }

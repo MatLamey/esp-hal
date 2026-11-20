@@ -151,3 +151,128 @@ impl RmtWriter {
         debug_assert!(self.offset == 0 || self.offset as usize == memsize / 2);
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Phase {
+    Initial, // whole RAM, 0..memsize
+    Lower,   // 0..memsize/2
+    Upper,   // memsize/2..memsize
+}
+
+impl Phase {
+    // The phase that follows after this one has been fully written.
+    fn next(self) -> Self {
+        match self {
+            Phase::Initial | Phase::Upper => Phase::Lower,
+            Phase::Lower => Phase::Upper,
+        }
+    }
+}
+
+/// Cyclic iterator over the slots of a channel's RAM.
+/// Never ends; bound it with `.take(n)`.
+#[derive(Debug)]
+pub(super) struct RamPingPong {
+    start: *mut PulseCode,
+    memsize: usize, // in codes
+    pos: usize,     // next slot, always < memsize
+    phase: Phase,
+}
+
+impl RamPingPong {
+    /// # Safety
+    /// `start..start.add(memsize)` must be valid channel RAM, with `memsize > 0`.
+    #[inline]
+    pub(super) unsafe fn new(start: *mut PulseCode, memsize: usize) -> Self {
+        Self {
+            start,
+            memsize,
+            pos: 0,
+            phase: Phase::Initial,
+        }
+    }
+}
+
+impl RamPingPong {
+    /// Slots for the next chunk. Advances the phase.
+    pub(super) fn next_chunk(&mut self) -> impl ExactSizeIterator<Item = *mut PulseCode> {
+        let (from, len) = match self.phase {
+            Phase::Initial => (0, self.memsize),
+            Phase::Lower => (0, self.memsize / 2),
+            Phase::Upper => (self.memsize / 2, self.memsize / 2),
+        };
+        self.phase = self.phase.next();
+        let base = self.start;
+        (from..from + len).map(move |i| unsafe { base.add(i) })
+    }
+}
+
+impl Iterator for RamPingPong {
+    type Item = *mut PulseCode;
+
+    #[inline]
+    fn next(&mut self) -> Option<*mut PulseCode> {
+        let slot = unsafe { self.start.add(self.pos) };
+        self.pos += 1;
+        if self.pos == self.memsize {
+            self.pos = 0;
+        }
+        Some(slot)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self.phase{
+            Phase::Initial | Phase::Upper => {
+                let size = self.memsize-self.pos;
+                (size, Some(size))
+            },
+            Phase::Lower => {
+                let size = self.memsize / 2 - self.pos;
+                (size, Some(size))
+            },
+            
+        }
+        
+    }
+}
+
+
+pub struct RmtWriterIter<'a> {
+    ram: RamPingPong,
+    state: WriterState,
+    data: &'a mut dyn Iterator<Item = PulseCode>,
+}
+
+impl<'a> RmtWriterIter<'a> {
+    pub fn new<I: Iterator<Item = PulseCode>>(raw: DynChannelAccess<Tx>, data: &'a mut I) -> Self {
+        let memsize = raw.memsize();
+        let ram =
+            unsafe { RamPingPong::new(raw.channel_ram_start() as *mut PulseCode, memsize.codes()) };
+        Self {
+            ram,
+            state: WriterState::Active,
+            data,
+        }
+    }
+
+    pub fn write(&mut self) {
+        let mut ram_slots = self.ram.next_chunk();
+
+        self.data.zip(ram_slots.by_ref()).for_each(|(src, dst)| unsafe {
+            dst.write_volatile(src);
+        });
+
+        if ram_slots.len() != 0 {
+            if let Some(slot) = ram_slots.next() {
+                unsafe {slot.write_volatile(PulseCode::end_marker());}
+            };
+            self.state = WriterState::Done;            
+        }      
+    }
+    
+    #[inline]
+    pub(super) fn state(&self) -> WriterState {
+        self.state
+    }
+}
+
